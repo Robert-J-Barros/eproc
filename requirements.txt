@@ -1,0 +1,6 @@
+playwright==1.47.0
+pyotp==2.9.0
+opencv-python-headless==4.10.0.84
+SQLAlchemy==2.0.35
+PyMySQL==1.1.1
+cryptography==43.0.1
