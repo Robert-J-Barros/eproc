@@ -311,7 +311,35 @@ def abrir_sessao(p):
     login(page)
     context.storage_state(path=STORAGE_STATE_PATH)
 
+    _verificar_cadastro_pendente(page)
+
     return browser, context, page
+
+
+def _verificar_cadastro_pendente(page):
+    """
+    Algumas contas, ao logar, são redirecionadas para uma tela
+    OBRIGATÓRIA de "Alterar Cadastro" (atualização cadastral -- CPF,
+    RG, dados pessoais, etc.) antes de liberar o resto do sistema.
+    Confirmado em execução real: nesse caso o menu "Consulta
+    Processual" não existe na tela, e o crawler ficava travado 30s
+    tentando clicar num link que não está lá, com uma mensagem de erro
+    confusa (timeout genérico).
+
+    Detectamos isso explicitamente para falhar rápido, com uma
+    mensagem clara -- essa é uma ação que exige revisão humana
+    (confirmar/corrigir dados cadastrais pessoais), não algo que o
+    crawler deve preencher e salvar sozinho.
+    """
+    titulo = page.query_selector("h1, h2, h3")
+    if titulo and "Alterar Cadastro" in titulo.inner_text():
+        raise RuntimeError(
+            "A conta caiu numa tela OBRIGATÓRIA de 'Alterar Cadastro' "
+            "(atualização cadastral) logo após o login -- o e-Proc exige "
+            "que os dados pessoais sejam revisados/confirmados manualmente "
+            "antes de liberar o resto do sistema. Entre nessa conta pelo "
+            "navegador comum, complete o cadastro, e rode o crawler de novo."
+        )
 
 
 def main():

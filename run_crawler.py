@@ -249,7 +249,14 @@ def main():
         try:
             while True:
                 print("\n########## Iniciando novo ciclo de varredura ##########")
-                executar_ciclo(page, pagina_empresa, db, config)
+                try:
+                    executar_ciclo(page, pagina_empresa, db, config)
+                except Exception as e:
+                    print(f"\n✗ Erro não tratado no ciclo: {e}")
+                    os.makedirs("output", exist_ok=True)
+                    page.screenshot(path="output/erro_ciclo_geral.png")
+                    print("Screenshot salvo em output/erro_ciclo_geral.png para diagnóstico.")
+                    raise
                 print(f"\nCiclo concluído. Aguardando {intervalo}s até o próximo ciclo...")
                 time.sleep(intervalo)
         finally:
