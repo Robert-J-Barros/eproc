@@ -100,7 +100,7 @@ def carregar_configuracao_filtros() -> dict:
     }
 
 
-def processar_empresa(pagina_empresa, db: Database, empresa: dict, config: dict):
+def processar_empresa(pagina_empresa, db: Database, empresa: dict, config: dict, referer: str = None):
     """
     Abre os processos de uma empresa e filtra cada um em duas etapas:
 
@@ -121,10 +121,20 @@ def processar_empresa(pagina_empresa, db: Database, empresa: dict, config: dict)
     imediatamente ao encontrar, e sem nunca navegar a aba principal de
     busca para longe da sua posição de paginação, eliminamos essa
     janela de expiração quase por completo.
+
+    `referer` -- a URL da página de busca principal, passada adiante
+    para simular que o link foi clicado de lá (ver bug do cabeçalho
+    Referer documentado em abrir_processos_da_empresa).
     """
     print(f"  Empresa: {empresa['nome']} ({empresa['id_pessoa']})")
 
-    abrir_processos_da_empresa(pagina_empresa, empresa)
+    abrir_processos_da_empresa(pagina_empresa, empresa, referer=referer)
+
+    # A partir daqui, pagina_empresa está na lista de processos da
+    # empresa -- usamos essa URL como referer para os links de
+    # detalhe de cada processo individual (mesmo mecanismo de
+    # proteção provavelmente se aplica).
+    url_lista_processos = pagina_empresa.url
 
     processos = listar_processos_da_empresa(pagina_empresa)
     print(f"    {len(processos)} processo(s) na listagem.")
@@ -137,7 +147,7 @@ def processar_empresa(pagina_empresa, db: Database, empresa: dict, config: dict)
     for processo_lista in candidatos:
         try:
             aguardar_entre_requisicoes()
-            pagina_empresa.goto(processo_lista["url"], timeout=60_000)
+            pagina_empresa.goto(processo_lista["url"], timeout=60_000, referer=url_lista_processos)
             pagina_empresa.wait_for_load_state("networkidle", timeout=TIMEOUT_PADRAO_MS)
 
             detalhe = extrair_detalhe_processo(pagina_empresa)
@@ -212,7 +222,7 @@ def executar_ciclo(page, pagina_empresa, db: Database, config: dict):
             )
 
             try:
-                processar_empresa(pagina_empresa, db, empresa, config)
+                processar_empresa(pagina_empresa, db, empresa, config, referer=page.url)
             except Exception as e:
                 print(f"  ✗ Erro processando empresa {empresa['id_pessoa']}: {e}")
 

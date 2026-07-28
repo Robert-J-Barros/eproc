@@ -240,7 +240,7 @@ def buscar_empresas_por_termo(page, termo: str, ao_encontrar_empresa=None) -> li
     )
 
 
-def abrir_processos_da_empresa(page, empresa: dict):
+def abrir_processos_da_empresa(page, empresa: dict, referer: str = None):
     """
     Navega até a lista de processos da empresa usando o href capturado
     antes, mais confiável que re-clicar via seletor genérico que pode
@@ -260,12 +260,28 @@ def abrir_processos_da_empresa(page, empresa: dict):
     lugar errado -- o servidor respondia "File not found." (confirmado
     via screenshot em execução real). Corrigido incluindo "/eproc/" na
     URL base antes de resolver o link relativo.
+
+    BUG CORRIGIDO (3ª rodada): mesmo com a URL certa, 100% das
+    empresas passaram a cair no "Painel do Advogado" -- não como algo
+    intermitente (hash expirado por tempo), mas sistematicamente, já
+    na primeira empresa de cada busca. Suspeita forte: o e-Proc exige
+    um cabeçalho HTTP Referer válido (a página de onde o link "veio")
+    para aceitar a navegação -- proteção comum contra acesso direto a
+    links profundos. page.goto() do Playwright NÃO envia Referer por
+    padrão (diferente de um clique real, que sempre inclui), e como
+    passamos a navegar numa aba nova (sem histórico), toda navegação
+    saía sem esse cabeçalho. Corrigido passando `referer` explicitamente
+    (a URL da página de busca principal), simulando que o link foi
+    clicado a partir de lá.
     """
     if empresa.get("href"):
         base_eproc = URL_LOGIN.rstrip("/") + "/eproc/"
         url_absoluta = urljoin(base_eproc, empresa["href"])
         aguardar_entre_requisicoes()
-        page.goto(url_absoluta, timeout=60_000)
+        if referer:
+            page.goto(url_absoluta, timeout=60_000, referer=referer)
+        else:
+            page.goto(url_absoluta, timeout=60_000)
     else:
         page.click(f"tr[data-idpessoa='{empresa['id_pessoa']}'] a")
     page.wait_for_load_state("networkidle", timeout=60_000)
@@ -312,6 +328,21 @@ def _recuperar_se_caiu_no_formulario_sem_classe(page):
     selecionar_classe_processual(page)
     aguardar_entre_requisicoes()
     consultar(page)
+
+    # IMPORTANTE: consultar() já espera "networkidle", mas isso nem
+    # sempre é suficiente -- a busca desta página parece ser via AJAX,
+    # e o "networkidle" pode considerar a página "pronta" antes da
+    # resposta real terminar de renderizar (confirmado em execução
+    # real: screenshot capturado mostrando "Carregando..." ainda
+    # visível). Por isso esperamos explicitamente pelo resultado de
+    # verdade -- tabela de processos OU mensagem de "sem resultado" --
+    # antes de devolver o controle para quem chamou esta função.
+    try:
+        linhas = page.locator("#divInfraAreaTabela tbody tr")
+        sem_resultado = page.get_by_text("Nenhum processo").or_(page.get_by_text("Nenhum registro"))
+        linhas.or_(sem_resultado).first.wait_for(timeout=20_000)
+    except PlaywrightTimeoutError:
+        print("    ⚠ Recuperação: resultado ainda não apareceu após 20s -- seguindo mesmo assim.")
 
 
 # ---------------------------------------------------------------------

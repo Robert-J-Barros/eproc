@@ -277,11 +277,18 @@ def abrir_sessao(p):
     login feito. Retorna (browser, context, page) prontos para uso.
     Reaproveitada tanto pela consulta única (main()) quanto pelo
     crawler de varredura em massa (run_crawler.py).
+
+    EPROC_FORCAR_NOVO_LOGIN=true (no .env) ignora o storage_state
+    salvo, mesmo que exista -- o contexto nasce "limpo" (sem cookies
+    de sessões anteriores), equivalente a uma aba anônima/incógnito.
+    Isso força login + MFA (TOTP) do zero em toda execução.
     """
     os.makedirs("output", exist_ok=True)
     browser = p.chromium.launch(headless=HEADLESS)
 
-    if os.path.exists(STORAGE_STATE_PATH):
+    forcar_novo_login = os.environ.get("EPROC_FORCAR_NOVO_LOGIN", "false").lower() == "true"
+
+    if not forcar_novo_login and os.path.exists(STORAGE_STATE_PATH):
         context = browser.new_context(storage_state=STORAGE_STATE_PATH)
     else:
         context = browser.new_context()
