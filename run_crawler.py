@@ -100,7 +100,7 @@ def carregar_configuracao_filtros() -> dict:
     }
 
 
-def processar_empresa(page, db: Database, empresa: dict, config: dict):
+def processar_empresa(pagina_empresa, db: Database, empresa: dict, config: dict):
     """
     Abre os processos de uma empresa e filtra cada um em duas etapas:
 
@@ -111,12 +111,22 @@ def processar_empresa(page, db: Database, empresa: dict, config: dict):
        completo antes de salvar.
 
     Isso evita abrir centenas de páginas de detalhe desnecessárias.
+
+    IMPORTANTE: `pagina_empresa` é uma ABA PRÓPRIA (nova), separada da
+    aba principal usada para paginar a lista de empresas -- ver
+    executar_ciclo(). Isso existe para resolver um bug real observado
+    em produção: o href/hash de cada empresa é um token de sessão que
+    pode expirar se a gente demorar demais (por navegação acumulada)
+    entre encontrar a empresa e visitá-la. Processando numa aba nova,
+    imediatamente ao encontrar, e sem nunca navegar a aba principal de
+    busca para longe da sua posição de paginação, eliminamos essa
+    janela de expiração quase por completo.
     """
     print(f"  Empresa: {empresa['nome']} ({empresa['id_pessoa']})")
 
-    abrir_processos_da_empresa(page, empresa)
+    abrir_processos_da_empresa(pagina_empresa, empresa)
 
-    processos = listar_processos_da_empresa(page)
+    processos = listar_processos_da_empresa(pagina_empresa)
     print(f"    {len(processos)} processo(s) na listagem.")
 
     candidatos = [p for p in processos if processo_bate_filtro_preliminar(p, config)]
@@ -127,10 +137,10 @@ def processar_empresa(page, db: Database, empresa: dict, config: dict):
     for processo_lista in candidatos:
         try:
             aguardar_entre_requisicoes()
-            page.goto(processo_lista["url"], timeout=60_000)
-            page.wait_for_load_state("networkidle", timeout=TIMEOUT_PADRAO_MS)
+            pagina_empresa.goto(processo_lista["url"], timeout=60_000)
+            pagina_empresa.wait_for_load_state("networkidle", timeout=TIMEOUT_PADRAO_MS)
 
-            detalhe = extrair_detalhe_processo(page)
+            detalhe = extrair_detalhe_processo(pagina_empresa)
 
             # Combina os dados da listagem (autor, réu, data, classe)
             # com os do detalhe (valor da causa, OAB) -- detalhe tem
@@ -145,6 +155,8 @@ def processar_empresa(page, db: Database, empresa: dict, config: dict):
                     "id_pessoa_autor": empresa["id_pessoa"],
                     "autor": dados.get("autor"),
                     "reu": dados.get("reu"),
+                    "cnpj_autor": dados.get("cnpj_autor"),
+                    "cnpj_reu": dados.get("cnpj_reu"),
                     "classe_processual": dados.get("classe_processual"),
                     "data_autuacao": dados.get("data_autuacao"),
                     "valor_causa": _parse_valor_brl(dados.get("valor_causa")),
@@ -164,20 +176,34 @@ def processar_empresa(page, db: Database, empresa: dict, config: dict):
     print(f"  -> {salvos} processo(s) salvos de {len(processos)} encontrados.")
 
 
-def executar_ciclo(page, db: Database, config: dict):
-    """Um ciclo completo: percorre todos os termos de busca configurados."""
+def executar_ciclo(page, pagina_empresa, db: Database, config: dict):
+    """
+    Um ciclo completo: percorre todos os termos de busca configurados.
+
+    Cada empresa encontrada é processada IMEDIATAMENTE (usando uma aba
+    AUXILIAR reutilizável -- `pagina_empresa`, criada uma única vez em
+    main() --, via callback passado a buscar_empresas_por_termo), sem
+    esperar a paginação inteira da lista de empresas terminar primeiro.
+    A aba principal (`page`) nunca sai da tela de busca/paginação --
+    só a aba auxiliar navega para cada empresa e seus processos.
+
+    IMPORTANTE (corrigido após observação em produção): a versão
+    anterior abria e FECHAVA uma aba nova para CADA empresa -- com
+    milhares de empresas, isso sobrecarregava o navegador (memória/CPU
+    de criar e destruir abas repetidamente), causando timeouts em
+    cascata. Agora a mesma aba auxiliar é reaproveitada, só navegando
+    para URLs diferentes -- muito mais leve, mantendo o mesmo
+    benefício de nunca perturbar a paginação da aba principal.
+    """
     for termo in config["termos_busca"]:
         print(f"\n=== Termo de busca: '{termo}' ===")
 
         abrir_consulta_processual(page)
         selecionar_tipo_pesquisa_nome_da_parte(page)
 
-        empresas = buscar_empresas_por_termo(page, termo)
-        print(f"{len(empresas)} empresa(s) encontrada(s) para '{termo}'.")
-
-        for empresa in empresas:
+        def processar_se_necessario(empresa):
             if db.empresa_ja_processada(empresa["id_pessoa"]):
-                continue  # dedupe -- já visitada em ciclo anterior
+                return  # dedupe -- já visitada em ciclo anterior
 
             db.registrar_empresa(empresa["id_pessoa"], empresa["nome"], empresa.get("cpf_cnpj"))
             db.salvar_checkpoint(
@@ -186,10 +212,12 @@ def executar_ciclo(page, db: Database, config: dict):
             )
 
             try:
-                processar_empresa(page, db, empresa, config)
+                processar_empresa(pagina_empresa, db, empresa, config)
             except Exception as e:
                 print(f"  ✗ Erro processando empresa {empresa['id_pessoa']}: {e}")
-                continue
+
+        empresas = buscar_empresas_por_termo(page, termo, ao_encontrar_empresa=processar_se_necessario)
+        print(f"{len(empresas)} empresa(s) encontrada(s) para '{termo}'.")
 
 
 def main():
@@ -203,11 +231,15 @@ def main():
 
     with sync_playwright() as p:
         browser, context, page = abrir_sessao(p)
+        # Aba auxiliar única, reaproveitada para processar todas as
+        # empresas do ciclo -- ver docstring de executar_ciclo.
+        pagina_empresa = context.new_page()
+        pagina_empresa.set_default_timeout(TIMEOUT_PADRAO_MS)
 
         try:
             while True:
                 print("\n########## Iniciando novo ciclo de varredura ##########")
-                executar_ciclo(page, db, config)
+                executar_ciclo(page, pagina_empresa, db, config)
                 print(f"\nCiclo concluído. Aguardando {intervalo}s até o próximo ciclo...")
                 time.sleep(intervalo)
         finally:

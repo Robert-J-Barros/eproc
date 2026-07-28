@@ -289,6 +289,17 @@ def abrir_sessao(p):
     page = context.new_page()
     page.set_default_timeout(TIMEOUT_PADRAO_MS)
 
+    # Captura e loga qualquer alert()/confirm()/prompt() disparado pelo
+    # JavaScript da página -- sem isso, o Playwright descarta esses
+    # diálogos silenciosamente por padrão, e a gente nunca fica sabendo
+    # que uma ação foi bloqueada por uma validação client-side (ex.:
+    # "entidades com muitos processos não podem ser consultadas").
+    def _log_dialog(dialog):
+        print(f"[DIÁLOGO JS] tipo={dialog.type} mensagem={dialog.message!r}")
+        dialog.dismiss()
+
+    page.on("dialog", _log_dialog)
+
     print("Fazendo login...")
     login(page)
     context.storage_state(path=STORAGE_STATE_PATH)

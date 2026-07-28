@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+output/
+qrcodes/
+*.png
+.venv/
+venv/

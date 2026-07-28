@@ -62,6 +62,8 @@ class Processo(Base):
     id_pessoa_autor = Column(String(64), index=True)
     autor = Column(String(255))
     reu = Column(String(255))
+    cnpj_autor = Column(String(20), nullable=True)
+    cnpj_reu = Column(String(20), nullable=True)
     classe_processual = Column(String(255))
     data_autuacao = Column(String(32))   # texto "dd/mm/aaaa" -- normalizar depois se precisar de range query
     valor_causa = Column(Numeric(14, 2))
@@ -94,6 +96,31 @@ class Database:
 
     def criar_schema(self):
         Base.metadata.create_all(self.engine)
+        self._garantir_colunas_novas()
+
+    def _garantir_colunas_novas(self):
+        """
+        create_all() só cria tabelas que ainda não existem -- não
+        adiciona colunas novas a tabelas já criadas anteriormente por
+        uma versão mais antiga do schema. Este método evolui o banco
+        sem perder os dados já coletados (equivalente a uma migration
+        simples, sem precisar de uma ferramenta de migration dedicada).
+        """
+        colunas_novas = {
+            "cnpj_autor": "VARCHAR(20)",
+            "cnpj_reu": "VARCHAR(20)",
+        }
+        with self.engine.connect() as conn:
+            for coluna, tipo_sql in colunas_novas.items():
+                existe = conn.execute(text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'processos' "
+                    "AND column_name = :coluna"
+                ), {"coluna": coluna}).scalar()
+                if not existe:
+                    conn.execute(text(f"ALTER TABLE processos ADD COLUMN {coluna} {tipo_sql}"))
+                    conn.commit()
+                    print(f"[db] Coluna '{coluna}' adicionada à tabela processos.")
 
     # --- Empresas ---------------------------------------------------
 

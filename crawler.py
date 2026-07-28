@@ -20,7 +20,7 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from eproc_automation import selecionar_classe_processual, consultar
+from eproc_automation import selecionar_classe_processual, consultar, URL_LOGIN
 
 
 def aguardar_entre_requisicoes():
@@ -56,7 +56,7 @@ def maximizar_resultados_por_pagina(page, table_id: str, valor: str = "100"):
     page.wait_for_timeout(400)
 
 
-def paginar_datatable(page, table_id: str, extrator_linha, timeout_ms: int = 30_000):
+def paginar_datatable(page, table_id: str, extrator_linha, timeout_ms: int = 30_000, ao_encontrar_item=None):
     """
     Percorre todas as páginas de uma tabela DataTables, chamando
     extrator_linha(row_element) para cada <tr> do <tbody> e devolvendo
@@ -64,6 +64,14 @@ def paginar_datatable(page, table_id: str, extrator_linha, timeout_ms: int = 30_
 
     extrator_linha deve retornar um dict com os dados da linha, ou
     None para pular linhas irrelevantes (ex.: "nenhum resultado").
+
+    ao_encontrar_item(item), se fornecido, é chamado IMEDIATAMENTE para
+    cada item extraído, antes de seguir para a próxima linha/página --
+    importante para casos onde o item tem um link/hash de sessão que
+    pode expirar se só for visitado muito depois (ver uso em
+    buscar_empresas_por_termo, que processa cada empresa assim que
+    encontrada, em vez de esperar a paginação inteira das milhares de
+    empresas terminar antes de começar a visitá-las).
     """
     resultados = []
     pagina = 1
@@ -76,6 +84,8 @@ def paginar_datatable(page, table_id: str, extrator_linha, timeout_ms: int = 30_
             item = extrator_linha(linha)
             if item is not None:
                 resultados.append(item)
+                if ao_encontrar_item:
+                    ao_encontrar_item(item)
 
         print(f"    página {pagina}: {len(resultados)} item(ns) coletado(s) até agora")
 
@@ -157,7 +167,7 @@ def _procurar_mensagem_erro_inline(page) -> str | None:
     return None
 
 
-def buscar_empresas_por_termo(page, termo: str) -> list[dict]:
+def buscar_empresas_por_termo(page, termo: str, ao_encontrar_empresa=None) -> list[dict]:
     """
     Preenche o campo de busca 'Nome da Parte' com um termo genérico
     (ex.: "LTDA"), marca as classes processuais configuradas e clica
@@ -178,6 +188,18 @@ def buscar_empresas_por_termo(page, termo: str) -> list[dict]:
     Ainda assim usamos page.type() (digitação caractere a caractere)
     em vez de fill() para o campo de nome, por segurança -- não
     prejudica em nada mesmo que não seja estritamente necessário aqui.
+
+    ao_encontrar_empresa(empresa), se fornecido, processa cada empresa
+    IMEDIATAMENTE ao ser encontrada na listagem (em vez de só depois
+    que TODAS as páginas de resultado forem percorridas). Isso resolve
+    um bug real observado em produção: o href/hash de cada empresa é
+    um token de sessão que pode expirar/invalidar por navegação -- se
+    esperarmos processar centenas de outras empresas antes de visitar
+    uma específica, o hash dela pode não funcionar mais (redireciona
+    para o "Painel do Advogado" em vez da lista de processos).
+    Processando cada empresa assim que encontrada, a janela entre
+    "encontrar" e "visitar" cai de "potencialmente horas" para
+    "segundos".
     """
     page.wait_for_selector("input[name='strNomeParte']", timeout=30_000)
     page.fill("input[name='strNomeParte']", "")  # limpa antes de digitar
@@ -212,7 +234,10 @@ def buscar_empresas_por_termo(page, termo: str) -> list[dict]:
     maximizar_resultados_por_pagina(page, "divInfraAreaTabela")
     print("  Iniciando paginação...")
 
-    return paginar_datatable(page, "divInfraAreaTabela", extrair_linha_empresa)
+    return paginar_datatable(
+        page, "divInfraAreaTabela", extrair_linha_empresa,
+        ao_encontrar_item=ao_encontrar_empresa,
+    )
 
 
 def abrir_processos_da_empresa(page, empresa: dict):
@@ -225,16 +250,68 @@ def abrir_processos_da_empresa(page, empresa: dict):
     Isso funciona normalmente num <a href> clicado pelo usuário (o
     navegador resolve sozinho contra a URL atual), mas page.goto() do
     Playwright exige uma URL absoluta -- por isso resolvemos com
-    urljoin() antes de navegar (mesma correção já aplicada para os
-    links de processo em listar_processos_da_empresa).
+    urljoin() antes de navegar.
+
+    BUG CORRIGIDO (2ª rodada): a primeira correção usou URL_LOGIN puro
+    (só o domínio, ex.: "https://eproc1g.tjrs.jus.br") como base do
+    urljoin -- mas o sistema roda sob o caminho "/eproc/"
+    (ex.: ".../eproc/controlador.php?..."). Sem esse segmento na base,
+    urljoin() gerava uma URL válida só na aparência, mas apontando pro
+    lugar errado -- o servidor respondia "File not found." (confirmado
+    via screenshot em execução real). Corrigido incluindo "/eproc/" na
+    URL base antes de resolver o link relativo.
     """
     if empresa.get("href"):
-        url_absoluta = urljoin(page.url, empresa["href"])
+        base_eproc = URL_LOGIN.rstrip("/") + "/eproc/"
+        url_absoluta = urljoin(base_eproc, empresa["href"])
         aguardar_entre_requisicoes()
         page.goto(url_absoluta, timeout=60_000)
     else:
         page.click(f"tr[data-idpessoa='{empresa['id_pessoa']}'] a")
     page.wait_for_load_state("networkidle", timeout=60_000)
+
+    _recuperar_se_caiu_no_formulario_sem_classe(page)
+
+
+def _recuperar_se_caiu_no_formulario_sem_classe(page):
+    """
+    Quando o link direto da empresa (num_id_parte + hash) falha, o
+    e-Proc não mostra uma tela de erro genérica -- ele volta para o
+    FORMULÁRIO de Consulta Processual, já com "Nome Parte" preenchido
+    corretamente (extraído do parâmetro str_nome_parte da própria URL
+    que falhou), mas SEM nenhuma Classe Processual marcada. Sem esse
+    filtro, a busca automática já-executada mostra "Nenhum processo
+    (em movimento) encontrado." -- não porque não existam processos,
+    mas porque falta o filtro de classe (confirmado via screenshot em
+    execução real).
+
+    Como o nome já está certo, dá pra RECUPERAR ali mesmo: só falta
+    marcar a Classe Processual de novo e clicar Consultar -- sem
+    precisar esperar o próximo ciclo completo do crawler.
+
+    IMPORTANTE: o campo "Nome Parte" existe no MESMO template de
+    página tanto no caso de sucesso quanto de falha (é o mesmo
+    formulário por cima dos resultados) -- por isso a detecção exige
+    TAMBÉM a mensagem exata "Nenhum processo (em movimento)
+    encontrado.", não só a presença do campo, evitando disparar a
+    recuperação numa página que na verdade já carregou com sucesso.
+    """
+    campo_nome_parte = page.query_selector("input[name='strNomeParte']")
+    if not campo_nome_parte:
+        return  # não é essa tela -- nada a recuperar aqui
+
+    valor_nome = campo_nome_parte.input_value()
+    if not valor_nome:
+        return  # formulário vazio -- não é o caso de recuperação
+
+    mensagem_nao_encontrado = page.get_by_text("Nenhum processo (em movimento) encontrado")
+    if mensagem_nao_encontrado.count() == 0:
+        return  # tem nome preenchido, mas não é o caso de falha -- provavelmente já carregou certo
+
+    print("    ↻ Caiu no formulário sem Classe Processual selecionada -- recuperando...")
+    selecionar_classe_processual(page)
+    aguardar_entre_requisicoes()
+    consultar(page)
 
 
 # ---------------------------------------------------------------------
@@ -303,7 +380,8 @@ def listar_processos_da_empresa(page) -> list[dict]:
     sem_resultado_locator = page.get_by_text("Nenhum processo").or_(
         page.get_by_text("Nenhum registro")
     )
-    combinado = linhas_locator.or_(sem_resultado_locator)
+    painel_advogado_locator = page.get_by_text("Painel do Advogado")
+    combinado = linhas_locator.or_(sem_resultado_locator).or_(painel_advogado_locator)
 
     try:
         combinado.first.wait_for(timeout=15_000)
@@ -318,6 +396,25 @@ def listar_processos_da_empresa(page) -> list[dict]:
         raise PlaywrightTimeoutError(
             f"Nem tabela nem mensagem de 'sem resultado' apareceram para esta "
             f"empresa. Screenshot salvo em output/erro_listar_processos.png.{detalhe}"
+        )
+
+    if painel_advogado_locator.count() > 0 and linhas_locator.count() == 0:
+        # Caso identificado em produção: em vez de mostrar a lista de
+        # processos (ou "nenhum encontrado"), o e-Proc às vezes
+        # redireciona para a tela inicial ("Painel do Advogado"),
+        # provavelmente porque o hash/link da empresa (token de
+        # sessão) expirou entre o momento em que a empresa foi listada
+        # e o momento em que foi visitada -- comum em varreduras
+        # longas com muitas empresas em fila. Diferente do "sem
+        # resultado" (que é um resultado válido), aqui a informação
+        # pode ter sido perdida -- por isso levantamos um erro
+        # distinto e claro, em vez de mascarar como sucesso silencioso.
+        page.screenshot(path="output/erro_painel_advogado.png")
+        raise PlaywrightTimeoutError(
+            "Redirecionado para o 'Painel do Advogado' em vez da lista de "
+            "processos -- provável expiração do hash/link da empresa (token "
+            "de sessão). Screenshot salvo em output/erro_painel_advogado.png. "
+            "Esta empresa pode precisar ser revisitada depois."
         )
 
     if linhas_locator.count() == 0:
@@ -421,6 +518,53 @@ def _extrair_oab(page) -> str | None:
     return match.group(1) if match else None
 
 
+def _extrair_cnpj_partes(page) -> dict:
+    """
+    Extrai o CNPJ do autor e do réu da tabela "Partes e
+    Representantes", procurando pelo padrão XX.XXX.XXX/XXXX-XX que
+    aparece entre parênteses ao lado do nome da parte (confirmado via
+    print real do usuário). Assume a mesma ordem de colunas usada em
+    _extrair_oab: primeiro td.autorReu = Autor, segundo = Réu.
+    """
+    celulas = page.query_selector_all("#tblPartesERepresentantes td.autorReu")
+    padrao_cnpj = re.compile(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})")
+
+    def extrair(indice):
+        if len(celulas) <= indice:
+            return None
+        texto = celulas[indice].inner_text()
+        match = padrao_cnpj.search(texto)
+        return match.group(1) if match else None
+
+    return {
+        "cnpj_autor": extrair(0),
+        "cnpj_reu": extrair(1),
+    }
+
+
+def _autor_em_recuperacao_judicial(page) -> bool:
+    """
+    Detecta se especificamente o AUTOR está marcado como "EM
+    RECUPERAÇÃO JUDICIAL" no bloco "Partes e Representantes" da
+    página de detalhe -- confirmado via print real do usuário.
+
+    IMPORTANTE: a checagem é só do lado do AUTOR, não do réu. Réu em
+    recuperação judicial é mantido normalmente (pode ser justamente um
+    alvo relevante -- credor precisando de representação no processo
+    de recuperação). Só quando o próprio autor da ação está em
+    recuperação judicial é que o processo é descartado.
+
+    Usa o mesmo seletor de _extrair_oab (primeiro `td.autorReu` no
+    DOM, que corresponde à coluna do Autor -- ela vem antes da coluna
+    do Réu na tabela).
+    """
+    autor_td = page.query_selector("#tblPartesERepresentantes td.autorReu")
+    if not autor_td:
+        return False
+    texto = autor_td.inner_text().upper()
+    return "RECUPERAÇÃO JUDICIAL" in texto or "RECUPERACAO JUDICIAL" in texto
+
+
 def extrair_detalhe_processo(page) -> dict:
     """
     Extrai os dados que só existem na página de detalhe do processo
@@ -442,6 +586,8 @@ def extrair_detalhe_processo(page) -> dict:
         "data_autuacao": texto_de("#txtAutuacao"),
         "valor_causa": _valor_por_rotulo_informacoes_adicionais(page, "Valor da Causa"),
         "oab": _extrair_oab(page),
+        "autor_em_recuperacao_judicial": _autor_em_recuperacao_judicial(page),
+        **_extrair_cnpj_partes(page),
         "url": page.url,
     }
 
@@ -502,6 +648,16 @@ def processo_bate_filtro_preliminar(dados: dict, config: dict) -> bool:
     if any(termo.upper() in reu for termo in config["reu_ignorar"]):
         return False
 
+    # Checagem preliminar e barata: se "recuperação judicial" já
+    # aparecer no próprio texto do AUTOR na listagem, rejeita antes de
+    # gastar uma navegação. IMPORTANTE: só do lado do autor -- réu em
+    # recuperação judicial é mantido normalmente (pode ser justamente
+    # um alvo relevante). A checagem definitiva (via tabela "Partes e
+    # Representantes" da página de detalhe) acontece depois, em
+    # processo_bate_com_filtros -- essa aqui é só uma otimização.
+    if "RECUPERAÇÃO JUDICIAL" in autor or "RECUPERACAO JUDICIAL" in autor:
+        return False
+
     data_autuacao = _parse_data_br(dados.get("data_autuacao"))
     if data_autuacao and not (config["data_inicio"] <= data_autuacao <= config["data_fim"]):
         return False
@@ -514,10 +670,12 @@ def processo_bate_com_filtros(dados: dict, config: dict) -> bool:
     Aplica os critérios descritos:
         - autor contém um dos sufixos configurados (LTDA, EIRELI, ...)
         - autor NÃO é um dos tipos a ignorar (banco, cooperativa, ...)
+        - réu NÃO contém nenhum dos termos a ignorar (banco, etc.)
+        - autor NÃO está "EM RECUPERAÇÃO JUDICIAL" (réu pode estar --
+          é mantido normalmente, pode ser justamente um alvo relevante)
         - data de autuação dentro do intervalo
         - valor da causa dentro do intervalo
         - OAB do advogado na UF configurada
-        - réu NÃO contém nenhum dos termos a ignorar (banco, etc.)
     """
     autor = (dados.get("autor") or "").upper()
     if not any(sufixo.upper() in autor for sufixo in config["autor_sufixos"]):
@@ -528,6 +686,14 @@ def processo_bate_com_filtros(dados: dict, config: dict) -> bool:
 
     reu = (dados.get("reu") or "").upper()
     if any(termo.upper() in reu for termo in config["reu_ignorar"]):
+        return False
+
+    # Checagem definitiva (dado real extraído da página de detalhe,
+    # tabela "Partes e Representantes" -- ver
+    # _autor_em_recuperacao_judicial em extrair_detalhe_processo).
+    # Só rejeita se for o AUTOR em recuperação judicial -- réu nessa
+    # situação é mantido de propósito (ver conversa com o usuário).
+    if dados.get("autor_em_recuperacao_judicial"):
         return False
 
     data_autuacao = _parse_data_br(dados.get("data_autuacao"))
