@@ -21,6 +21,8 @@ import os
 import pyotp
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+from captcha import CaptchaDetector, CaptchaSolver, CaptchaSolverError, NopeCHAClient, NopeCHAProvider
+
 # ============================================================
 # CONFIGURAÇÃO -- lida de variáveis de ambiente (ver .env.example)
 # ============================================================
@@ -55,6 +57,14 @@ NAVEGACAO_TIMEOUT_MS = 60_000
 # próximas execuções -- só é pedido de novo quando a sessão expirar.
 STORAGE_STATE_PATH = os.environ.get("EPROC_STORAGE_STATE", "output/storage_state.json")
 
+# Chave de API da NopeCHA, usada apenas SE um captcha for detectado em
+# alguma tela (evento raro no e-Proc). Sem captcha na tela, esta
+# variável nunca é usada -- ver verificar_e_resolver_captcha().
+# Pode ficar vazia; o detector continua rodando normalmente, só que se
+# um captcha realmente aparecer, o NopeCHAClient vai falhar com uma
+# mensagem clara pedindo para configurar EPROC_NOPECHA_API_KEY.
+NOPECHA_API_KEY = os.environ.get("EPROC_NOPECHA_API_KEY", "").strip() or None
+
 
 def validar_configuracao():
     """Falha cedo e com mensagem clara se alguma variável obrigatória
@@ -72,6 +82,48 @@ def validar_configuracao():
             f"Copie .env.example para .env e preencha os valores, ou "
             f"exporte-as diretamente no ambiente."
         )
+
+
+def verificar_e_resolver_captcha(page, onde: str = ""):
+    """
+    Checagem rápida (sem espera) de captcha na tela atual -- e-Proc e o
+    Keycloak raramente exibem um, então isso NÃO fica em polling: só
+    olha o DOM uma vez, na hora em que é chamada, e volta na mesma hora
+    se não achar nada. Custo de chamar isso "só por garantia" em vários
+    pontos do fluxo é desprezível (uma consulta de seletor no DOM).
+
+    Se encontrar um captcha, tenta resolver via NopeCHA (API de token).
+    Isso SIM pode levar alguns segundos (chamada de rede + polling do
+    resultado), mas só acontece nesse caso raro.
+
+    `onde` é só um rótulo pro log, pra saber em que etapa do fluxo o
+    captcha apareceu (ex.: "login", "consulta").
+
+    Levanta CaptchaSolverError se o captcha for detectado mas não puder
+    ser resolvido -- nesse caso o fluxo normal (login/consulta) não vai
+    conseguir prosseguir mesmo, então é melhor falhar aqui com uma
+    mensagem clara do que travar depois num timeout genérico.
+    """
+    captcha = CaptchaDetector().detect(page)
+
+    if captcha is None:
+        return None
+
+    rotulo = f" ({onde})" if onde else ""
+    print(f"[CAPTCHA] Detectado{rotulo}: {captcha.tipo.value} -- tentando resolver via NopeCHA...")
+
+    try:
+        solver = CaptchaSolver(NopeCHAProvider(NopeCHAClient(api_key=NOPECHA_API_KEY)))
+        resultado = solver.solve(page, captcha)
+    except CaptchaSolverError as e:
+        print(f"[CAPTCHA] Falha ao resolver{rotulo}: {e}")
+        raise
+
+    print(
+        f"[CAPTCHA] Resolvido{rotulo} em {resultado.elapsed_time:.1f}s "
+        f"via {resultado.provider}."
+    )
+    return resultado
 
 
 def gerar_codigo_mfa():
@@ -98,6 +150,7 @@ def ja_esta_logado(page) -> bool:
     Keycloak (não logado) ou se caiu direto no painel (logado).
     """
     page.goto(URL_LOGIN, timeout=NAVEGACAO_TIMEOUT_MS)
+    verificar_e_resolver_captcha(page, onde="tela de login")
     try:
         page.wait_for_selector("#username", timeout=5_000)
         return False  # apareceu tela de login -> não está logado
@@ -130,6 +183,8 @@ def login(page):
     page.fill("#username", USUARIO)
     page.fill("#password", SENHA)
     page.click("#kc-login")
+
+    verificar_e_resolver_captcha(page, onde="pós-login, antes do MFA")
 
     # --- Etapa de MFA (TOTP) ---
     page.wait_for_selector("#otp", timeout=TIMEOUT_PADRAO_MS)
@@ -169,6 +224,7 @@ def abrir_consulta_processual(page):
     page.locator("a[aria-label='Consultar Processos']").first.click()
 
     page.wait_for_load_state("networkidle", timeout=NAVEGACAO_TIMEOUT_MS)
+    verificar_e_resolver_captcha(page, onde="abrir consulta processual")
 
 
 def selecionar_tipo_pesquisa_nome_da_parte(page):
@@ -269,6 +325,7 @@ def consultar(page):
     """
     page.get_by_role("button", name="Consultar", exact=True).first.click()
     page.wait_for_load_state("networkidle", timeout=NAVEGACAO_TIMEOUT_MS)
+    verificar_e_resolver_captcha(page, onde="após consultar")
 
 
 def abrir_sessao(p):

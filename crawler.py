@@ -20,7 +20,7 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from eproc_automation import selecionar_classe_processual, consultar, URL_LOGIN
+from eproc_automation import selecionar_classe_processual, consultar, verificar_e_resolver_captcha, URL_LOGIN
 
 
 def aguardar_entre_requisicoes():
@@ -109,6 +109,7 @@ def paginar_datatable(page, table_id: str, extrator_linha, timeout_ms: int = 30_
         except PlaywrightTimeoutError:
             pass  # alguns temas de DataTables não disparam eventos de rede visíveis
         page.wait_for_timeout(300)  # pequena folga para o redraw da tabela
+        verificar_e_resolver_captcha(page, onde=f"paginação {table_id} (página {pagina})")
 
     return resultados
 
@@ -285,6 +286,7 @@ def abrir_processos_da_empresa(page, empresa: dict, referer: str = None):
     else:
         page.click(f"tr[data-idpessoa='{empresa['id_pessoa']}'] a")
     page.wait_for_load_state("networkidle", timeout=60_000)
+    verificar_e_resolver_captcha(page, onde="abrir processos da empresa")
 
     _recuperar_se_caiu_no_formulario_sem_classe(page)
 
