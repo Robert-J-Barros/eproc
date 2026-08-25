@@ -10,6 +10,11 @@ services:
       # Coloque aqui a imagem do QR code (ex.: qrcodes/qrcode.png) para
       # o decode_qr.py conseguir ler de dentro do container
       - ./qrcodes:/app/qrcodes
+      # Coloque aqui arquivos de termos de busca grandes demais para
+      # caber numa linha de .env (ver CRAWLER_TERMOS_BUSCA_EXTRA) --
+      # ex.: ./crawler_config/termos_extra.txt no host vira
+      # /app/crawler_config/termos_extra.txt dentro do container.
+      - ./crawler_config:/app/crawler_config
     networks:
       - eproc_net
     # Mantém o container rodando (ver CMD no Dockerfile) para permitir

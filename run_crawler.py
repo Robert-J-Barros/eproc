@@ -49,6 +49,36 @@ def _lista_env(nome: str, padrao: str) -> list:
     return [item.strip() for item in valor.split(",") if item.strip()]
 
 
+def _lista_arquivo(caminho: str) -> list:
+    """
+    Lê termos de busca de um arquivo texto, um por linha (linhas em
+    branco ou começando com '#' são ignoradas).
+    """
+    with open(caminho, encoding="utf-8") as f:
+        return [
+            linha.strip() for linha in f
+            if linha.strip() and not linha.strip().startswith("#")
+        ]
+
+
+def _lista_termos_extra() -> list:
+    """
+    CRAWLER_TERMOS_BUSCA_EXTRA aceita duas formas:
+      1. Lista de termos separados por vírgula (uso normal).
+      2. Caminho para um arquivo texto com um termo por linha -- útil
+         quando a lista é grande demais para caber confortavelmente
+         numa única variável de ambiente (ex.: centenas de combinações
+         de prefixo). Detectado automaticamente: se o valor apontar
+         para um arquivo que existe, lê os termos de lá.
+    """
+    valor = os.environ.get("CRAWLER_TERMOS_BUSCA_EXTRA", "").strip()
+    if not valor:
+        return []
+    if os.path.isfile(valor):
+        return _lista_arquivo(valor)
+    return [item.strip() for item in valor.split(",") if item.strip()]
+
+
 def _data_env(nome: str, padrao: str) -> date:
     valor = os.environ.get(nome, padrao)
     ano, mes, dia = map(int, valor.split("-"))
@@ -78,7 +108,7 @@ def _gerar_termos_busca(config_sufixos: list) -> list:
     """
     palavras_base = _lista_env("CRAWLER_PALAVRAS_BASE", "")
     gerados = [f"{palavra} {sufixo}" for palavra in palavras_base for sufixo in config_sufixos]
-    extras = _lista_env("CRAWLER_TERMOS_BUSCA_EXTRA", "")
+    extras = _lista_termos_extra()
     # Remove duplicatas preservando ordem
     return list(dict.fromkeys(gerados + extras))
 
@@ -226,7 +256,11 @@ def executar_ciclo(page, pagina_empresa, db: Database, config: dict):
             except Exception as e:
                 print(f"  ✗ Erro processando empresa {empresa['id_pessoa']}: {e}")
 
-        empresas = buscar_empresas_por_termo(page, termo, ao_encontrar_empresa=processar_se_necessario)
+        try:
+            empresas = buscar_empresas_por_termo(page, termo, ao_encontrar_empresa=processar_se_necessario)
+        except PlaywrightTimeoutError as e:
+            print(f"  ✗ Nenhum resultado para '{termo}' (ou erro na busca), pulando para o próximo termo: {e}")
+            continue
         print(f"{len(empresas)} empresa(s) encontrada(s) para '{termo}'.")
 
 
