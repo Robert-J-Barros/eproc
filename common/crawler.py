@@ -20,7 +20,9 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from eproc_automation import selecionar_classe_processual, consultar, verificar_e_resolver_captcha, URL_LOGIN
+from eproc_automation import (
+    CAMINHO_APP, URL_LOGIN, consultar, selecionar_classe_processual, verificar_e_resolver_captcha,
+)
 
 
 def aguardar_entre_requisicoes():
@@ -255,12 +257,22 @@ def abrir_processos_da_empresa(page, empresa: dict, referer: str = None):
 
     BUG CORRIGIDO (2ª rodada): a primeira correção usou URL_LOGIN puro
     (só o domínio, ex.: "https://eproc1g.tjrs.jus.br") como base do
-    urljoin -- mas o sistema roda sob o caminho "/eproc/"
-    (ex.: ".../eproc/controlador.php?..."). Sem esse segmento na base,
+    urljoin -- mas o sistema roda sob um caminho próprio (ex.: TJRS é
+    ".../eproc/controlador.php?..."). Sem esse segmento na base,
     urljoin() gerava uma URL válida só na aparência, mas apontando pro
     lugar errado -- o servidor respondia "File not found." (confirmado
-    via screenshot em execução real). Corrigido incluindo "/eproc/" na
+    via screenshot em execução real). Corrigido incluindo o caminho na
     URL base antes de resolver o link relativo.
+
+    BUG CORRIGIDO (4ª rodada, confirmado ao vivo contra o TJTO): esse
+    caminho ("/eproc/") NÃO é padrão nacional -- o TJTO roda sob
+    "/eprocV2_prod_1grau/", não "/eproc/". Usar o caminho fixo do TJRS
+    contra outro tribunal gera uma URL que aponta pro domínio certo mas
+    caminho errado -- 404 Not Found do nginx, não um erro do e-Proc em
+    si (sintoma: "Nem tabela nem mensagem de 'sem resultado' apareceram
+    para esta empresa" pra 100% das empresas, sistematicamente).
+    Corrigido lendo o caminho de CAMINHO_APP (EPROC_CAMINHO_APP no
+    .env), configurável por tribunal.
 
     BUG CORRIGIDO (3ª rodada): mesmo com a URL certa, 100% das
     empresas passaram a cair no "Painel do Advogado" -- não como algo
@@ -276,7 +288,7 @@ def abrir_processos_da_empresa(page, empresa: dict, referer: str = None):
     clicado a partir de lá.
     """
     if empresa.get("href"):
-        base_eproc = URL_LOGIN.rstrip("/") + "/eproc/"
+        base_eproc = URL_LOGIN.rstrip("/") + CAMINHO_APP
         url_absoluta = urljoin(base_eproc, empresa["href"])
         aguardar_entre_requisicoes()
         if referer:

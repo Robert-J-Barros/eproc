@@ -34,24 +34,58 @@ from captcha import CaptchaDetector, CaptchaSolver, CaptchaSolverError, NopeCHAC
 
 URL_LOGIN = os.environ.get("EPROC_URL", "https://eproc1g.tjrs.jus.br")
 
+# Caminho onde a aplicação e-Proc roda dentro do domínio do tribunal --
+# usado pra montar URLs absolutas a partir de href relativos (ver
+# crawler.py::abrir_processos_da_empresa). IMPORTANTE (confirmado ao
+# vivo contra o TJTO): esse caminho é específico de CADA TRIBUNAL, não
+# um padrão nacional -- é "/eproc/" no TJRS mas
+# "/eprocV2_prod_1grau/" no TJTO. Configurável via EPROC_CAMINHO_APP
+# pra não quebrar ao trocar de tribunal.
+CAMINHO_APP = "/" + os.environ.get("EPROC_CAMINHO_APP", "eproc").strip("/") + "/"
+
 USUARIO = os.environ.get("EPROC_USUARIO", "")
 SENHA = os.environ.get("EPROC_SENHA", "")
 TOTP_SECRET = os.environ.get("EPROC_TOTP_SECRET", "")
 
 NOME_DA_PARTE = os.environ.get("EPROC_NOME_DA_PARTE", "NOME AQUI")
 
-# Classes processuais a marcar no multiselect (value -> descrição)
-# Os 2 primeiros já tinham sido confirmados visualmente. Os 2 últimos
-# foram confirmados apenas como "value" via captura de tráfego (corpo
-# real da consulta) -- não vimos o texto exibido na tela para eles,
-# então preencha a descrição real assim que possível (ajuda na
-# legibilidade dos logs, não afeta o funcionamento).
-CLASSES_PROCESSUAIS = {
+# Classes processuais a marcar no multiselect (value -> descrição).
+#
+# IMPORTANTE (confirmado ao vivo contra o TJTO): os `value` de cada
+# classe são específicos de CADA TRIBUNAL, não um código nacional
+# compartilhado -- "Embargos Parciais à Ação Monitória" é
+# "0000100137" no TJRS mas "0000002840" no TJTO. Por isso esse mapa
+# vem do .env (EPROC_CLASSES_PROCESSUAIS), não fixo no código: cada
+# TJXX/.env configura os values corretos pro seu próprio tribunal, sem
+# precisar tocar em common/. Sem essa variável, cai no padrão abaixo
+# (os values confirmados do TJRS, comportamento de sempre).
+#
+# Formato: "value1:Descrição 1,value2:Descrição 2" (vírgula separa
+# classes, dois-pontos separa value de descrição).
+_CLASSES_PROCESSUAIS_PADRAO = {
     "0000000028": "MONITÓRIA",
     "0000100137": "Embargos Parciais à Ação Monitória",
-    "0000000094": "TODO: confirmar nome desta classe",
-    "0000000029": "TODO: confirmar nome desta classe",
+    "0000000094": "EXECUÇÃO DE TÍTULO EXTRAJUDICIAL",
+    "0000000029": "PROCEDIMENTO COMUM CÍVEL",
 }
+
+
+def _carregar_classes_processuais() -> dict[str, str]:
+    bruto = os.environ.get("EPROC_CLASSES_PROCESSUAIS", "").strip()
+    if not bruto:
+        return dict(_CLASSES_PROCESSUAIS_PADRAO)
+
+    classes = {}
+    for par in bruto.split(","):
+        par = par.strip()
+        if not par:
+            continue
+        value, _, descricao = par.partition(":")
+        classes[value.strip()] = descricao.strip() or value.strip()
+    return classes
+
+
+CLASSES_PROCESSUAIS = _carregar_classes_processuais()
 
 HEADLESS = os.environ.get("EPROC_HEADLESS", "true").lower() != "false"
 TIMEOUT_PADRAO_MS = 30_000  # 30s de timeout para esperas
@@ -424,10 +458,23 @@ def abrir_sessao(p):
 
     forcar_novo_login = os.environ.get("EPROC_FORCAR_NOVO_LOGIN", "false").lower() == "true"
 
+    # Sem isso, o Chromium headless se identifica com
+    # "HeadlessChrome/..." no User-Agent -- confirmado em execução real
+    # que pelo menos um tribunal (TJTO) bloqueia isso com 403 Forbidden
+    # no nginx, antes de sequer chegar na aplicação (sintoma: qualquer
+    # navegação trava em timeout esperando um elemento que nunca
+    # existiu, porque a página inteira é a tela de erro do nginx, não
+    # o e-Proc). O TJRS não bloqueia, mas usar um UA de navegador normal
+    # não quebra nada lá também.
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    )
+
     if not forcar_novo_login and os.path.exists(STORAGE_STATE_PATH):
-        context = browser.new_context(storage_state=STORAGE_STATE_PATH)
+        context = browser.new_context(storage_state=STORAGE_STATE_PATH, user_agent=user_agent)
     else:
-        context = browser.new_context()
+        context = browser.new_context(user_agent=user_agent)
 
     page = context.new_page()
     page.set_default_timeout(TIMEOUT_PADRAO_MS)
