@@ -5,5 +5,14 @@ __pycache__/
 *.pyc
 output/
 qrcodes/
+crawler_config/
 *.png
 README.md
+
+# Cada Dockerfile só copia de common/ (ver TJ*/Dockerfile) -- excluir
+# as pastas dos outros tribunais do contexto de build evita mandar
+# .env/sessão/screenshots de um tribunal pro build de outro à toa,
+# mesmo não sendo copiados de qualquer forma.
+TJRS/
+TJRO/
+TJTO/

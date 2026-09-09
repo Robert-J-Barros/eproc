@@ -1,9 +1,14 @@
 """
-Automação de consulta processual no e-Proc (TJRS) usando Playwright.
+Automação de consulta processual no e-Proc usando Playwright.
 
-Reaproveita toda a lógica validada manualmente no Console do navegador
-durante o desenvolvimento anterior no Power Automate Desktop:
-  - Login em http://eproc1g.tjrs.jus.br
+Nasceu para o TJRS (reaproveitando a lógica validada manualmente no
+Console do navegador durante o desenvolvimento anterior no Power
+Automate Desktop), mas o login já suporta qualquer tribunal e-Proc
+apontado por EPROC_URL -- ver docstring de login() para os dois fluxos
+possíveis (Keycloak/SSO ou formulário nativo). Confirmado em uso real
+contra o TJTO além do TJRS.
+
+  - Login em EPROC_URL (TJRS: http://eproc1g.tjrs.jus.br)
   - Seleção de "Tipo de Pesquisa" = Nome da Parte
   - Preenchimento do multiselect "Classe Processual" (MONITÓRIA +
     Embargos Parciais à Ação Monitória)
@@ -146,25 +151,31 @@ def gerar_codigo_mfa():
 def ja_esta_logado(page) -> bool:
     """
     Verifica se a sessão restaurada (storage_state) ainda é válida --
-    tenta ir para a URL de login e vê se foi redirecionado para o
-    Keycloak (não logado) ou se caiu direto no painel (logado).
+    tenta ir para a URL de login e vê se apareceu ALGUMA tela de login
+    conhecida (Keycloak/TJRS ou nativa do e-Proc/TJTO -- ver login())
+    ou se caiu direto no painel (logado).
+
+    IMPORTANTE: nem todo tribunal usa o SSO Keycloak -- checar só
+    `#username` faria essa função sempre concluir "já logado" nos
+    tribunais com login nativo (o campo lá é `#txtUsuario`), mesmo numa
+    sessão nova sem cookie nenhum. Por isso checamos os dois seletores
+    conhecidos, não só um (mesmo ajuste já confirmado necessário ao
+    testar contra o TJTO).
     """
     page.goto(URL_LOGIN, timeout=NAVEGACAO_TIMEOUT_MS)
     verificar_e_resolver_captcha(page, onde="tela de login")
+    campo_login = page.locator("#username").or_(page.locator("#txtUsuario"))
     try:
-        page.wait_for_selector("#username", timeout=5_000)
+        campo_login.first.wait_for(state="visible", timeout=5_000)
         return False  # apareceu tela de login -> não está logado
     except PlaywrightTimeoutError:
         return True  # não apareceu tela de login -> sessão ainda válida
 
 
-def login(page):
+def _login_keycloak(page):
     """
-    Realiza o login no e-Proc, incluindo a etapa de MFA (TOTP).
-
-    IMPORTANTE: o e-Proc não tem formulário de login próprio -- ele
-    redireciona (302) para um servidor Keycloak (SSO/OpenID Connect) em
-    keycloak-eks.tjrs.jus.br, com tokens dinâmicos (session_code,
+    Fluxo de login via Keycloak (SSO/OpenID Connect) -- confirmado no
+    TJRS (keycloak-eks.tjrs.jus.br), com tokens dinâmicos (session_code,
     execution, state, nonce) que mudam a cada tentativa. O Playwright
     lida com os redirects e cookies automaticamente; só precisamos dos
     seletores dos formulários, confirmados via captura no Burp Suite:
@@ -175,10 +186,6 @@ def login(page):
       Formulário de código MFA (Keycloak, aparece após o login):
         input#otp, checkbox#saveDevice, button#kc-login
     """
-    if ja_esta_logado(page):
-        print("Sessão restaurada de execução anterior -- pulando login/MFA.")
-        return
-
     page.wait_for_selector("#username", timeout=TIMEOUT_PADRAO_MS)
     page.fill("#username", USUARIO)
     page.fill("#password", SENHA)
@@ -201,6 +208,78 @@ def login(page):
     page.click("#kc-login")
 
     page.wait_for_load_state("networkidle", timeout=NAVEGACAO_TIMEOUT_MS)
+
+
+def _login_nativo(page):
+    """
+    Fluxo de login nativo do e-Proc (sem Keycloak/SSO) -- usado por
+    tribunais que não roteiam o login por um SSO externo (confirmado no
+    TJTO; outros tribunais e-Proc sem Keycloak tendem a compartilhar a
+    mesma tela, por ser o mesmo software-base). Formulário na própria
+    página do e-Proc:
+
+      input#txtUsuario, input#pwdSenha, button#sbmEntrar
+
+    IMPORTANTE: #pwdSenha é um campo "mascarado" -- existe também um
+    <input type="password" name="pwdSenha" style="display:none"> oculto
+    que parece ser sincronizado via JS a cada tecla digitada no campo
+    visível (`type="text"`, classe `masked`). `page.fill()` seta o
+    valor direto via DOM sem simular teclas de verdade, arriscando não
+    disparar essa sincronização -- por isso usamos digitação simulada
+    (`press_sequentially`) aqui.
+
+    Confirmado também: o botão "Entrar" (#sbmEntrar) é
+    `<button type="button" onclick="Submit('login')">`, não um botão
+    de submit nativo -- um clique normal do Playwright já dispara esse
+    onclick corretamente.
+
+    MFA (TOTP) aparece na mesma página depois do clique, sem navegação:
+        input#txtAcessoCodigo, button#btnValidar
+    """
+    page.wait_for_selector("#txtUsuario", timeout=TIMEOUT_PADRAO_MS)
+    page.fill("#txtUsuario", USUARIO)
+    page.locator("#pwdSenha").press_sequentially(SENHA, delay=50)
+    page.click("#sbmEntrar")
+
+    verificar_e_resolver_captcha(page, onde="pós-login, antes do MFA")
+
+    # --- Etapa de MFA (TOTP) ---
+    page.wait_for_selector("#txtAcessoCodigo", timeout=TIMEOUT_PADRAO_MS)
+    codigo = gerar_codigo_mfa()
+    page.fill("#txtAcessoCodigo", codigo)
+    page.click("#btnValidar")
+
+    page.wait_for_load_state("networkidle", timeout=NAVEGACAO_TIMEOUT_MS)
+
+
+def login(page):
+    """
+    Realiza o login no e-Proc, incluindo a etapa de MFA (TOTP).
+
+    Detecta automaticamente qual fluxo de login usar (não depende de
+    "qual tribunal é" -- só olha qual formulário está na tela): Keycloak/
+    SSO (TJRS, `#username`) ou nativo do e-Proc (TJTO e possivelmente
+    TJRO, `#txtUsuario`) -- ver _login_keycloak/_login_nativo. Isso
+    evita ter que confirmar de antemão qual fluxo um tribunal novo usa;
+    o script descobre sozinho na hora.
+    """
+    if ja_esta_logado(page):
+        print("Sessão restaurada de execução anterior -- pulando login/MFA.")
+        return
+
+    # IMPORTANTE (confirmado em execução real no TJTO): checar por
+    # `#txtUsuario` primeiro é um bug -- um tribunal pode servir tanto o
+    # formulário nativo (então #txtUsuario existe e está VISÍVEL) quanto
+    # uma página Keycloak (então #username está visível, mas o HTML
+    # ainda inclui um #txtUsuario OCULTO residual/de relay do template
+    # nativo). Checar #txtUsuario por EXISTÊNCIA (sem olhar visibilidade)
+    # escolheria sempre o fluxo nativo errado nesse segundo caso.
+    # #username é exclusivo do Keycloak -- checar ele primeiro resolve
+    # os dois casos corretamente.
+    if page.query_selector("#username"):
+        _login_keycloak(page)
+    else:
+        _login_nativo(page)
 
 
 def abrir_consulta_processual(page):

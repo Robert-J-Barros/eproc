@@ -1,0 +1,63 @@
+# Stack independente do TJRS -- código compartilhado (ver ../common),
+# mas container, .env e banco de dados 100% próprios desta pasta.
+# Rodar: dentro desta pasta, `docker compose up -d`.
+services:
+  eproc-automation:
+    build:
+      context: ..
+      dockerfile: TJRS/Dockerfile
+    container_name: eproc-tjrs
+    env_file:
+      - .env
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      # Screenshots de erro (erro_timeout.png / erro_geral.png) ficam
+      # acessíveis fora do container, na pasta ./output
+      - ./output:/app/output
+      # Coloque aqui a imagem do QR code (ex.: qrcodes/qrcode.png) para
+      # o decode_qr.py conseguir ler de dentro do container
+      - ./qrcodes:/app/qrcodes
+      # Coloque aqui arquivos de termos de busca grandes demais para
+      # caber numa linha de .env (ver CRAWLER_TERMOS_BUSCA_EXTRA)
+      - ./crawler_config:/app/crawler_config
+    # Mantém o container rodando (ver CMD no Dockerfile) para permitir
+    # `docker compose exec` e rodar os scripts manualmente
+    stdin_open: true
+    tty: true
+    # IPC compartilhado evita problemas de memória do Chromium em
+    # alguns hosts Docker (recomendação oficial do Playwright)
+    ipc: host
+
+  mysql:
+    image: mysql:8.0
+    container_name: eproc-tjrs-mysql
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - tjrs_mysql_data:/var/lib/mysql
+    ports:
+      # Porta do HOST distinta por tribunal (TJRS=3306, TJRO=3307,
+      # TJTO=3308) -- permite rodar todas as stacks ao mesmo tempo sem
+      # colidir, e inspecionar cada banco de fora com um client externo
+      # (DBeaver, MySQL Workbench, etc.).
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+# Volume nomeado com prefixo do tribunal -- mesmo que o Compose já
+# isole por projeto (nome da pasta) por padrão, o prefixo deixa
+# explícito, ao listar `docker volume ls`, qual tribunal é dono de cada
+# volume.
+volumes:
+  tjrs_mysql_data:
