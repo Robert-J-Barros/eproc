@@ -165,6 +165,46 @@ def verificar_e_resolver_captcha(page, onde: str = ""):
     return resultado
 
 
+def _verificar_mfa_aceito(page, onde: str = ""):
+    """
+    Confere se o código MFA (TOTP) enviado foi ACEITO pelo e-Proc.
+
+    BUG CORRIGIDO (confirmado em execução real contra o TJRS, screenshot
+    output/erro_ciclo_geral.png): quando o código é rejeitado, a página
+    NÃO navega -- ela recarrega o MESMO formulário com um erro inline
+    ("Código autenticador inválido."), então `wait_for_load_state
+    ("networkidle")` (chamado logo em seguida em _login_keycloak/
+    _login_nativo) considera a etapa "concluída" mesmo com o MFA tendo
+    falhado. Sem essa checagem, login() seguia adiante como se tivesse
+    logado com sucesso, salvava esse storage_state QUEBRADO, e só
+    quebrava 3 passos depois com um erro de timeout completamente sem
+    relação aparente (tentando clicar no menu "Consulta Processual",
+    que não existe numa sessão não autenticada) -- em vez de apontar
+    direto pro problema real (código MFA rejeitado).
+
+    Checagem rápida sem polling (mesmo espírito de
+    verificar_e_resolver_captcha): o erro, quando existe, já está
+    renderizado no momento em que chamamos isso (logo após o
+    wait_for_load_state que já esperou a resposta assentar).
+    """
+    erro = page.get_by_text("Código autenticador inválido").or_(
+        page.get_by_text("código informado é inválido")
+    )
+    if erro.count() == 0:
+        return
+
+    rotulo = f" ({onde})" if onde else ""
+    raise RuntimeError(
+        f"Código MFA (TOTP) rejeitado pelo e-Proc{rotulo} ('Código "
+        f"autenticador inválido'). Confira se EPROC_TOTP_SECRET está "
+        f"correto e corresponde ao autenticador cadastrado nesta conta "
+        f"-- se o app/dispositivo 2FA foi trocado ou recadastrado "
+        f"recentemente, o secret antigo para de funcionar. Também "
+        f"pode ser corrida (código expirou entre gerar e submeter); "
+        f"tente rodar de novo antes de mexer na configuração."
+    )
+
+
 def gerar_codigo_mfa():
     """
     Gera o código TOTP atual (6 dígitos), igual ao app autenticador.
@@ -203,7 +243,28 @@ def ja_esta_logado(page) -> bool:
         campo_login.first.wait_for(state="visible", timeout=5_000)
         return False  # apareceu tela de login -> não está logado
     except PlaywrightTimeoutError:
-        return True  # não apareceu tela de login -> sessão ainda válida
+        pass  # não apareceu tela de login -> sessão ainda válida
+
+    # BUG CORRIGIDO (confirmado em execução real contra o TJTO): quando
+    # a sessão restaurada é válida, o e-Proc dispara um alert() nativo
+    # ("Usuário logado como fulano/... Utilize o botão 'Sair do
+    # Sistema'...") ANTES de seguir com o redirecionamento esperado pro
+    # painel. Como esse alert é bloqueante no JS da página e o handler
+    # de diálogo (ver _log_dialog em abrir_sessao) o dispensa
+    # automaticamente, a página fica parada nesse estado intermediário
+    # -- NÃO necessariamente na tela final com todos os widgets JS já
+    # inicializados (ex.: o plugin do multiselect de Classe Processual).
+    # Sintoma real: todo termo de busca falhava esperando
+    # "div.ms-parent.classeMultipleSelect" ficar visível, só quando a
+    # sessão era restaurada (login novo não tinha esse problema).
+    # Corrigido navegando pra URL de login MAIS UMA VEZ aqui -- com os
+    # cookies já validados, essa segunda carga não deve mais disparar o
+    # alert (ou se disparar, o handler dispensa de novo, mas agora
+    # partindo de uma página já estável) e entrega a página final
+    # limpa e totalmente inicializada pro resto do fluxo.
+    page.goto(URL_LOGIN, timeout=NAVEGACAO_TIMEOUT_MS)
+    verificar_e_resolver_captcha(page, onde="tela de login (2ª carga, sessão restaurada)")
+    return True
 
 
 def _login_keycloak(page):
@@ -242,6 +303,7 @@ def _login_keycloak(page):
     page.click("#kc-login")
 
     page.wait_for_load_state("networkidle", timeout=NAVEGACAO_TIMEOUT_MS)
+    _verificar_mfa_aceito(page, onde="MFA Keycloak")
 
 
 def _login_nativo(page):
@@ -284,6 +346,7 @@ def _login_nativo(page):
     page.click("#btnValidar")
 
     page.wait_for_load_state("networkidle", timeout=NAVEGACAO_TIMEOUT_MS)
+    _verificar_mfa_aceito(page, onde="MFA nativo")
 
 
 def login(page):
@@ -310,10 +373,22 @@ def login(page):
     # escolheria sempre o fluxo nativo errado nesse segundo caso.
     # #username é exclusivo do Keycloak -- checar ele primeiro resolve
     # os dois casos corretamente.
-    if page.query_selector("#username"):
-        _login_keycloak(page)
-    else:
-        _login_nativo(page)
+    # BUG CORRIGIDO: login() era o ÚNICO ponto do fluxo sem screenshot
+    # em caso de erro (todo o resto -- consulta, listagem, detalhe --
+    # já tira). Uma falha aqui (ex.: MFA que nunca aparece, timeout
+    # inesperado num seletor) só deixava o traceback puro no log, sem
+    # nenhuma evidência visual de ONDE a página ficou travada -- muito
+    # mais difícil de diagnosticar que qualquer outra falha do fluxo.
+    try:
+        if page.query_selector("#username"):
+            _login_keycloak(page)
+        else:
+            _login_nativo(page)
+    except Exception:
+        os.makedirs("output", exist_ok=True)
+        page.screenshot(path="output/erro_login.png")
+        print("Screenshot salvo em output/erro_login.png para diagnóstico.")
+        raise
 
 
 def abrir_consulta_processual(page):

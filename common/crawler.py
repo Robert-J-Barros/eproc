@@ -443,22 +443,27 @@ def listar_processos_da_empresa(page) -> list[dict]:
             f"empresa. Screenshot salvo em output/erro_listar_processos.png.{detalhe}"
         )
 
-    if painel_advogado_locator.count() > 0 and linhas_locator.count() == 0:
-        # Caso identificado em produção: em vez de mostrar a lista de
-        # processos (ou "nenhum encontrado"), o e-Proc às vezes
-        # redireciona para a tela inicial ("Painel do Advogado"),
-        # provavelmente porque o hash/link da empresa (token de
-        # sessão) expirou entre o momento em que a empresa foi listada
-        # e o momento em que foi visitada -- comum em varreduras
-        # longas com muitas empresas em fila. Diferente do "sem
-        # resultado" (que é um resultado válido), aqui a informação
-        # pode ter sido perdida -- por isso levantamos um erro
-        # distinto e claro, em vez de mascarar como sucesso silencioso.
+    # BUG CORRIGIDO (confirmado em produção contra o TJTO, screenshot
+    # output/erro_painel_advogado.png): "Painel do Advogado" é um item
+    # FIXO do menu lateral, presente em TODA página logada (inclusive
+    # na própria tela de Consulta Processual com resultado "Nenhum
+    # processo encontrado") -- não é exclusivo da tela de dashboard
+    # real. A ordem original checava painel_advogado_locator ANTES de
+    # sem_resultado_locator, então TODA empresa sem processo nas
+    # classes selecionadas (resultado válido e comum) era classificada
+    # como "sessão expirada" -- erro falso que nunca marcava a empresa
+    # como processada, prendendo-a num loop de reprocessamento eterno a
+    # cada ciclo. Corrigido invertendo a prioridade: só tratamos como
+    # redirecionamento real quando NEM linhas NEM a mensagem de "sem
+    # resultado" apareceram (única situação em que a presença do texto
+    # do menu deixa de ser ambígua).
+    if linhas_locator.count() == 0 and sem_resultado_locator.count() == 0 and painel_advogado_locator.count() > 0:
         page.screenshot(path="output/erro_painel_advogado.png")
         raise PlaywrightTimeoutError(
-            "Redirecionado para o 'Painel do Advogado' em vez da lista de "
-            "processos -- provável expiração do hash/link da empresa (token "
-            "de sessão). Screenshot salvo em output/erro_painel_advogado.png. "
+            "Nem tabela de processos nem mensagem de 'sem resultado' "
+            "apareceram -- provável redirecionamento para o 'Painel do "
+            "Advogado' por expiração do hash/link da empresa (token de "
+            "sessão). Screenshot salvo em output/erro_painel_advogado.png. "
             "Esta empresa pode precisar ser revisitada depois."
         )
 
@@ -668,14 +673,58 @@ def _parse_data_br(texto: str):
         return None
 
 
+def _normalizar_classe(texto: str) -> str:
+    return (texto or "").strip().upper()
+
+
+def classe_processual_selecionada(classe_texto: str, classes_configuradas: dict) -> bool:
+    """
+    Confere se o texto de "Classe Processual" exibido na página
+    (listagem ou detalhe do processo) corresponde a uma das classes
+    marcadas no multiselect (CLASSES_PROCESSUAIS/EPROC_CLASSES_PROCESSUAIS).
+
+    BUG CORRIGIDO: o crawler nunca conferia isso -- confiava 100% no
+    filtro do próprio multiselect do e-Proc (ver
+    selecionar_classe_processual em eproc_automation.py) pra garantir
+    que só processos das classes certas apareceriam na listagem. Mas
+    nada garante isso na prática: o fluxo de recuperação
+    (_recuperar_se_caiu_no_formulario_sem_classe) reabre a consulta, e
+    falhas de sincronização do plugin de checkboxes (ou qualquer outro
+    motivo do lado do servidor) podem devolver processos de classes
+    diferentes das selecionadas -- confirmado em produção: classes
+    processuais diferentes das configuradas sendo salvas no banco. Essa
+    função é a rede de segurança do lado do crawler.
+
+    Comparação por "contém" (não igualdade exata) e sem diferenciar
+    maiúsculas/minúsculas, nos dois sentidos -- o texto exibido na tela
+    pode vir com prefixo/sufixo (ex.: código da classe) que não está na
+    descrição configurada em CLASSES_PROCESSUAIS.
+    """
+    classe_normalizada = _normalizar_classe(classe_texto)
+    if not classe_normalizada:
+        return False
+    for descricao in classes_configuradas.values():
+        descricao_normalizada = _normalizar_classe(descricao)
+        if descricao_normalizada and (
+            descricao_normalizada in classe_normalizada
+            or classe_normalizada in descricao_normalizada
+        ):
+            return True
+    return False
+
+
 def processo_bate_filtro_preliminar(dados: dict, config: dict) -> bool:
     """
     Filtro rápido usando só os dados já disponíveis na LISTAGEM (autor,
-    réu, data de autuação) -- evita a navegação e o carregamento da
-    página de detalhe (que só é necessária para valor da causa e OAB)
-    para processos que já claramente não servem. Importante para a
-    escala do crawler: evita centenas de navegações desnecessárias.
+    réu, data de autuação, classe processual) -- evita a navegação e o
+    carregamento da página de detalhe (que só é necessária para valor
+    da causa e OAB) para processos que já claramente não servem.
+    Importante para a escala do crawler: evita centenas de navegações
+    desnecessárias.
     """
+    if not classe_processual_selecionada(dados.get("classe_processual"), config["classes_processuais"]):
+        return False
+
     autor = (dados.get("autor") or "").upper()
     if not any(sufixo.upper() in autor for sufixo in config["autor_sufixos"]):
         return False
@@ -713,6 +762,8 @@ def processo_bate_filtro_preliminar(dados: dict, config: dict) -> bool:
 def processo_bate_com_filtros(dados: dict, config: dict) -> bool:
     """
     Aplica os critérios descritos:
+        - classe processual é uma das configuradas (rede de segurança;
+          ver classe_processual_selecionada)
         - autor contém um dos sufixos configurados (LTDA, EIRELI, ...)
         - autor NÃO é um dos tipos a ignorar (banco, cooperativa, ...)
         - réu NÃO contém nenhum dos termos a ignorar (banco, etc.)
@@ -722,6 +773,9 @@ def processo_bate_com_filtros(dados: dict, config: dict) -> bool:
         - valor da causa dentro do intervalo
         - OAB do advogado na UF configurada
     """
+    if not classe_processual_selecionada(dados.get("classe_processual"), config["classes_processuais"]):
+        return False
+
     autor = (dados.get("autor") or "").upper()
     if not any(sufixo.upper() in autor for sufixo in config["autor_sufixos"]):
         return False

@@ -33,7 +33,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 from eproc_automation import (
     abrir_sessao, abrir_consulta_processual,
     selecionar_tipo_pesquisa_nome_da_parte, validar_configuracao,
-    TIMEOUT_PADRAO_MS,
+    TIMEOUT_PADRAO_MS, CLASSES_PROCESSUAIS,
 )
 from db import Database
 from crawler import (
@@ -118,6 +118,7 @@ def carregar_configuracao_filtros() -> dict:
     autor_sufixos = _lista_env("CRAWLER_AUTOR_SUFIXOS", "LTDA,EIRELI")
     return {
         "termos_busca": _gerar_termos_busca(autor_sufixos),
+        "classes_processuais": CLASSES_PROCESSUAIS,
         "autor_sufixos": autor_sufixos,
         "reu_ignorar": _lista_env(
             "CRAWLER_REU_IGNORAR", "BANCO,COOPERATIVA,MUNICIPIO,ESTADO"

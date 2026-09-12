@@ -48,7 +48,7 @@ services:
       # TJTO=3308) -- permite rodar todas as stacks ao mesmo tempo sem
       # colidir, e inspecionar cada banco de fora com um client externo
       # (DBeaver, MySQL Workbench, etc.).
-      - "3306:3306"
+      - "3309:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
